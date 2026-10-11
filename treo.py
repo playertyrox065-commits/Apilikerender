@@ -1,0 +1,1316 @@
+# ===== Ffree li =====
+import socket
+_original_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _ipv4_only_getaddrinfo
+# =======================
+
+import os, re, json, time, logging, asyncio, threading, requests
+from datetime import datetime, timedelta, timezone
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, ChatMemberHandler, CallbackQueryHandler
+from telegram.request import HTTPXRequest
+import base64 as _b64
+
+# ================== CONFIG ==================
+BOT_TOKEN = "8917310231:AAEmCLz56dM0DbPF5SORTAl0ydMSb_sw3Sc"
+ADMIN_IDS = [8830951108]
+GROUP_ID = -1004312899731 
+REQUIRED_GROUPS = [-1004312899731, -1003732990426]
+GROUP_LINKS = {
+    -1004312899731: "https://t.me/pwchat2",
+    -1004414491085: "https://t.me/tyrox36sex",
+}
+GROUP_NAMES = {
+    -1004312899731: "Nhóm buff 200 like free",
+    -1004414491085: "Kênh buff 300 like free",
+}
+ADMIN_CONTACT = "@nhansinh36"
+SIGNATURE = "@nhansinh36"
+
+# ⭐ API LIKE
+# ⭐ API LIKE
+LIKE_API_URL = "http://127.0.0.1:25695/likes"
+ADMIN_KEY = "TmrKeyTest"
+
+# ⭐ Giới hạn like member
+LIKE_MEMBER_MAX = 20
+
+# ⭐ Autolike mặc định
+FIXED_AUTOLIKE = {
+    "8830951108": [
+        {"uid": "1629081107 ", "target_likes": 10000}
+    ]
+}
+# ============================================
+
+
+AUTOLIKE_HOUR = 5
+AUTOLIKE_MINUTE = 5
+AUTOLIKE_SECOND = 0
+
+USERS_FILE = "users.json"
+DATA_FILE = "autolike.json"
+ADMINS_FILE = "admins.json"
+SUPER_ADMINS_FILE = "super_admins.json"
+BOXES_FILE = "boxes.json"
+PROGRESS_FILE = "autolike_progress.json"
+LIKE_SWITCH_FILE = "like_switch.json"
+
+
+def is_like_enabled():
+    try:
+        with open(LIKE_SWITCH_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled", True))
+    except Exception:
+        return True
+
+
+def set_like_enabled(enabled):
+    with open(LIKE_SWITCH_FILE, "w", encoding="utf-8") as f:
+        json.dump({"enabled": bool(enabled)}, f, ensure_ascii=False, indent=2)
+
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logger = logging.getLogger("LikeFFBot")
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
+BOT_LOOP = None
+VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn():
+    return datetime.now(VN_TZ)
+
+def time_str_auto():
+    return f"{AUTOLIKE_HOUR:02d}:{AUTOLIKE_MINUTE:02d}:{AUTOLIKE_SECOND:02d}"
+
+
+# ============ USER / ADMIN / BOX ============
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f: return json.load(f)
+    except: return {}
+
+def save_users(d):
+    with open(USERS_FILE, "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False, indent=2)
+
+def get_user(cid):
+    u = load_users(); k = str(cid)
+    if k not in u: u[k] = {"locked": False, "joined": False}; save_users(u)
+    return u[k]
+
+def set_user(cid, **kw):
+    u = load_users(); k = str(cid)
+    if k not in u: u[k] = {"locked": False, "joined": False}
+    u[k].update(kw); save_users(u)
+
+# ============ GIỚI HẠN /LIKE ============
+LIKE_DAILY_LIMIT = 2
+
+def get_like_count_today(cid):
+    if is_admin(cid):
+        return 0
+    u = get_user(cid)
+    today = now_vn().strftime("%Y-%m-%d")
+    if u.get("like_date") != today:
+        return 0
+    return int(u.get("like_count", 0))
+
+def can_use_like_today(cid):
+    """User thường: tối đa 2 lần/ngày, reset 00:00 VN. Admin: không giới hạn."""
+    if is_admin(cid):
+        return True
+    return get_like_count_today(cid) < LIKE_DAILY_LIMIT
+
+def mark_like_used(cid):
+    if is_admin(cid):
+        return
+    today = now_vn().strftime("%Y-%m-%d")
+    count = get_like_count_today(cid) + 1
+    set_user(cid, like_date=today, like_count=count)
+
+def load_extra_admins():
+    try:
+        with open(ADMINS_FILE, "r", encoding="utf-8") as f: return json.load(f)
+    except: return []
+
+def save_extra_admins(l):
+    with open(ADMINS_FILE, "w", encoding="utf-8") as f: json.dump(l, f, ensure_ascii=False, indent=2)
+
+def load_extra_super_admins():
+    try:
+        with open(SUPER_ADMINS_FILE, "r", encoding="utf-8") as f: return json.load(f)
+    except: return []
+
+def save_extra_super_admins(l):
+    with open(SUPER_ADMINS_FILE, "w", encoding="utf-8") as f: json.dump(l, f, ensure_ascii=False, indent=2)
+
+def is_super_admin(cid):
+    try: c = int(cid)
+    except: return False
+    if c in ADMIN_IDS: return True
+    return c in load_extra_super_admins()
+
+def is_normal_admin(cid):
+    try: c = int(cid)
+    except: return False
+    return c in load_extra_admins()
+
+def is_admin(cid):
+    return is_super_admin(cid) or is_normal_admin(cid)
+
+def load_boxes():
+    try:
+        with open(BOXES_FILE, "r", encoding="utf-8") as f:
+            return [int(x) for x in json.load(f)]
+    except: return []
+
+def save_boxes(b):
+    with open(BOXES_FILE, "w", encoding="utf-8") as f: json.dump(b, f, ensure_ascii=False, indent=2)
+
+def get_required_groups():
+    return list(REQUIRED_GROUPS)
+
+def get_active_groups():
+    base = list(REQUIRED_GROUPS)
+    for g in load_boxes():
+        if g not in base: base.append(g)
+    return base
+
+
+# ============ AUTOLIKE DATA ============
+def load_data():
+    data = {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f: data = json.load(f)
+    except: data = {}
+
+    for cid, uids in FIXED_AUTOLIKE.items():
+        ex = data.get(cid, [])
+        ex_uids = {e["uid"] if isinstance(e, dict) else str(e) for e in ex}
+        for item in uids:
+            if isinstance(item, dict):
+                uid_str = item["uid"]; target = item.get("target_likes", 220)
+            else:
+                uid_str = str(item); target = 220
+            if uid_str not in ex_uids:
+                ex.append({"uid": uid_str, "target_likes": target, "end_date": "2099-12-31"})
+        data[cid] = ex
+
+    for cid, ents in data.items():
+        for e in ents:
+            if "end_date" not in e: e["end_date"] = "2099-12-31"
+            if "target_likes" not in e: e["target_likes"] = 220
+    return data
+
+def save_data(d):
+    with open(DATA_FILE, "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+# ============ AUTOLIKE PROGRESS (TÍCH LŨY) ============
+def load_progress():
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_progress(uid, sent_likes, target_likes):
+    """Lưu tiến độ 1 UID (tích lũy nhiều ngày)"""
+    try:
+        data = load_progress()
+        today = now_vn().strftime("%Y-%m-%d")
+        key = str(uid)
+
+        # Nếu chưa có → tạo mới
+        if key not in data:
+            data[key] = {
+                "sent_today": 0,
+                "sent_total": 0,
+                "target": target_likes,
+                "date": today,
+                "first_run": now_vn().strftime("%H:%M:%S %d/%m/%Y"),
+                "last_run": now_vn().strftime("%H:%M:%S %d/%m/%Y"),
+                "days": 0,
+            }
+
+        # Nếu qua ngày mới → reset sent_today, tăng days
+        if data[key].get("date") != today:
+            data[key]["sent_today"] = 0
+            data[key]["date"] = today
+            data[key]["days"] = data[key].get("days", 0) + 1
+
+        # Cập nhật
+        data[key]["sent_today"] = sent_likes
+        data[key]["sent_total"] = data[key].get("sent_total", 0) + sent_likes
+        data[key]["target"] = target_likes
+        data[key]["last_run"] = now_vn().strftime("%H:%M:%S %d/%m/%Y")
+
+        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"save_progress: {e}")
+
+
+def get_progress(uid, target_likes):
+    """Lấy tiến độ 1 UID (trả về dict)"""
+    empty = {"sent_today": 0, "sent_total": 0, "days": 0,
+             "target": target_likes, "last_run": "Chưa chạy", "first_run": "Chưa chạy"}
+    try:
+        data = load_progress()
+        today = now_vn().strftime("%Y-%m-%d")
+        key = str(uid)
+
+        if key not in data:
+            return empty
+
+        d = data[key]
+        # Nếu qua ngày mới → sent_today = 0
+        if d.get("date") != today:
+            return {
+                "sent_today": 0,
+                "sent_total": d.get("sent_total", 0),
+                "days": d.get("days", 0),
+                "target": d.get("target", target_likes),
+                "last_run": d.get("last_run", "Chưa chạy"),
+                "first_run": d.get("first_run", "Chưa chạy"),
+            }
+
+        return {
+            "sent_today": d.get("sent_today", 0),
+            "sent_total": d.get("sent_total", 0),
+            "days": d.get("days", 0),
+            "target": d.get("target", target_likes),
+            "last_run": d.get("last_run", "Chưa chạy"),
+            "first_run": d.get("first_run", "Chưa chạy"),
+        }
+    except:
+        return empty
+
+
+# ============ GROUP CHECK ============
+async def get_missing_groups(ctx, user_id):
+    missing = []
+    for gid in get_required_groups():
+        try:
+            m = await ctx.bot.get_chat_member(chat_id=gid, user_id=user_id)
+            if m.status not in ("member", "administrator", "creator"): missing.append(gid)
+        except Exception as e:
+            logger.warning(f"Check member: {e}")
+            missing.append(gid)
+    return missing
+
+async def safe_send(update, text, parse_mode="Markdown", reply_markup=None):
+    for i in range(3):
+        try:
+            await update.message.reply_text(
+                text, parse_mode=parse_mode, reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"safe_send {i+1}/3: {e}")
+            if i < 2:
+                try: await asyncio.sleep(2)
+                except: pass
+    return False
+
+async def send_join_prompt(update, text, missing=None):
+    if missing is None: missing = get_required_groups()
+    kb = []
+    for gid in missing:
+        link = GROUP_LINKS.get(gid, "https://t.me/ductri36skin")
+        name = GROUP_NAMES.get(gid, f"Nhóm {gid}")
+        kb.append([InlineKeyboardButton(f"📥 Vào {name}", url=link)])
+    kb.append([InlineKeyboardButton("✅ Xác nhận đã vào đủ nhóm", callback_data="check_join")])
+    await safe_send(update, text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def require_join(update, ctx):
+    try:
+        uid = update.effective_user.id
+        cid = update.effective_chat.id
+        if is_admin(uid): return True
+        req = get_required_groups()
+        act = get_active_groups()
+        if update.effective_chat.type == "private":
+            miss = await get_missing_groups(ctx, uid)
+            if miss:
+                await send_join_prompt(update, f"⛔ *Bạn phải vào ĐỦ {len(req)} nhóm.*", miss)
+            else:
+                await safe_send(update, "⛔ *Bot chỉ hoạt động trong nhóm.*")
+            return False
+        if cid not in act: return False
+        miss = await get_missing_groups(ctx, uid)
+        user = get_user(uid)
+        if miss:
+            if user.get("joined"): set_user(uid, joined=False, locked=True)
+            await send_join_prompt(update, f"⛔ *Chưa vào đủ nhóm.*", miss)
+            return False
+        if user.get("locked"):
+            await safe_send(update, f"🔒 *Tài khoản bị khoá.*\n📩 Nhắn: {ADMIN_CONTACT}")
+            return False
+        if not user.get("joined"): set_user(uid, joined=True, locked=False)
+        return True
+    except Exception as e:
+        logger.error(f"require_join: {e}")
+        return False
+
+
+# ============ API CALLS ============
+def call_like_api(uid, key=ADMIN_KEY, target=None):
+    """Gọi API Like và trả thông báo dễ chẩn đoán khi API lỗi."""
+    try:
+        params = {"uid": str(uid), "key": str(key)}
+        if target is not None:
+            params["target"] = str(target)
+
+        # Timeout vừa phải để lệnh Telegram không bị treo quá lâu.
+        r = requests.get(LIKE_API_URL, params=params, timeout=(8, 35))
+        if not r.ok:
+            return {"status": -1, "message": f"API HTTP {r.status_code}"}
+
+        try:
+            data = r.json()
+        except ValueError:
+            # API có thể trả trang HTML hoặc thông báo text thay vì JSON.
+            body = (r.text or "").strip().replace("\n", " ")[:220]
+            if body:
+                return {"status": -1, "message": f"API trả dữ liệu không phải JSON: {body}"}
+            return {"status": -1, "message": "API trả phản hồi rỗng/không phải JSON"}
+
+        # Một số API trả chuỗi/list thay vì object; tránh lỗi .get trên string.
+        if not isinstance(data, dict):
+            detail = str(data).strip()[:220] or "Không có nội dung"
+            return {"status": -1, "message": f"API trả dữ liệu sai định dạng: {detail}"}
+
+        if str(data.get("status", "")).lower() == "off":
+            return {"status": "off", "message": str(data.get("message") or "Tính năng like đang tắt")}
+
+        d = data.get("data")
+        if isinstance(d, dict):
+            # Nếu API có trường lỗi/trạng thái thì không coi nhầm phản hồi lỗi là thành công.
+            status_text = str(data.get("status", "")).lower()
+            if status_text in {"error", "failed", "fail", "false"}:
+                return {"status": -1, "message": str(data.get("message") or data.get("error") or "API báo thất bại")}
+            return {
+                "status": 0,
+                "nickname": d.get("Player Nickname", d.get("nickname", "N/A")),
+                "uid": d.get("UID", d.get("uid", uid)),
+                "level": d.get("Level", d.get("level", "?")),
+                "region": d.get("Region", d.get("region", "VN")),
+                "likes_given": d.get("Likes Given By API", d.get("likes_given", 0)),
+                "likes_before": d.get("Likes Before Command", d.get("likes_before", 0)),
+                "likes_after": d.get("Likes After Command", d.get("likes_after", 0)),
+                "time": d.get("Time Sent", d.get("time", "?")),
+            }
+
+        message = data.get("message") or data.get("error") or data.get("detail")
+        if message is None:
+            message = str(data)[:220]
+        return {"status": -1, "message": str(message)[:300]}
+
+    except requests.exceptions.Timeout:
+        return {"status": -1, "message": "API quá thời gian chờ (35 giây); kiểm tra server API"}
+    except requests.exceptions.ConnectionError:
+        return {"status": -1, "message": "Không kết nối được API; kiểm tra DNS/mạng hoặc server API đang tắt"}
+    except requests.exceptions.RequestException as e:
+        return {"status": -1, "message": f"Lỗi kết nối API: {type(e).__name__}"}
+    except Exception as e:
+        logger.exception("call_like_api failed")
+        return {"status": -1, "message": f"Lỗi xử lý API: {type(e).__name__}: {str(e)[:180]}"}
+
+
+def format_like_message(data, uid):
+    if data.get("status") == "off":
+        return (
+            f"╭──────────────────────╮\n"
+            f"│  🔕 *LIKE ĐANG TẮT*  │\n"
+            f"╰──────────────────────╯\n\n"
+            f"💡 Admin đã tắt tính năng like.\n"
+            f"📩 Liên hệ: {ADMIN_CONTACT}"
+        )
+
+    if data.get("status") != 0:
+        return (
+            f"╭──────────────────────╮\n"
+            f"│  ❌ *LIKE THẤT BẠI*  │\n"
+            f"╰──────────────────────╯\n\n"
+            f"🆔 UID: `{uid}`\n"
+            f"📝 Lý do: {data.get('message', 'Unknown')}\n\n"
+            f"{SIGNATURE}"
+        )
+
+    nickname = data.get("nickname", "N/A")
+    level    = data.get("level", "?")
+    region   = data.get("region", "VN")
+    likes_before = data.get("likes_before", 0)
+    likes_after  = data.get("likes_after", 0)
+    likes_given  = data.get("likes_given", 0)
+    tts = data.get("time", "?")
+
+    return (
+        f"╭──────────────────────────╮\n"
+        f"│  ✅ *LIKE THÀNH CÔNG*  │\n"
+        f"╰──────────────────────────╯\n\n"
+        f"👤 *Tên:* {nickname}\n"
+        f"🆔 *UID:* `{uid}`\n"
+        f"🎮 *Level:* {level}\n"
+        f"🌍 *Region:* {region}\n\n"
+        f"❤️ *Likes trước:* `{likes_before}`\n"
+        f"💚 *Likes sau:* `{likes_after}`\n"
+        f"🔥 *Like đã gửi:* `+{likes_given}`\n"
+        f"⏱ *Thời gian:* {tts} sec\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⛱ *Được Buff Bởi* {SIGNATURE}"
+    )
+
+
+def is_valid_uid(uid):
+    return bool(re.fullmatch(r"\d{5,15}", uid or ""))
+
+
+# ============ BROADCAST ============
+async def broadcast_to_all_groups(app, text, parse_mode="Markdown"):
+    groups = get_active_groups()
+    sent = failed = 0
+    for gid in groups:
+        for i in range(2):
+            try:
+                await app.bot.send_message(chat_id=gid, text=text, parse_mode=parse_mode,
+                                           disable_web_page_preview=True)
+                sent += 1
+                break
+            except Exception as e:
+                if i == 1:
+                    failed += 1
+                    logger.error(f"Broadcast {gid}: {e}")
+                else:
+                    await asyncio.sleep(1)
+    logger.info(f"[BROADCAST] {sent}/{len(groups)}")
+
+
+# ============ HANDLERS ============
+async def start(update, context):
+    try:
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if update.effective_chat.type == "private":
+            miss = await get_missing_groups(context, user_id)
+            if miss:
+                text = (f"🤖 *Bot Like Free Fire*\n\n"
+                        f"⛔ *Bạn phải vào ĐỦ {len(get_required_groups())} nhóm.*\n\n"
+                        f"📋 Còn thiếu *{len(miss)}* nhóm:\n\n"
+                        f"🆔 Chat ID: `{user_id}`")
+                await send_join_prompt(update, text, miss)
+            else:
+                await safe_send(update,
+                    f"🤖 *Bot Like Free Fire*\n\n"
+                    f"✅ Bạn đã vào đủ nhóm.\n"
+                    f"👉 Dùng lệnh trong nhóm.\n\n"
+                    f"🆔 Chat ID: `{user_id}`")
+            return
+
+        if chat_id not in get_active_groups(): return
+
+        text = (f"╭──────────────────────────╮\n"
+                f"│  🤖 *BOT LIKE FREE FIRE*  │\n"
+                f"╰──────────────────────────╯\n\n"
+                f"📌 *Lệnh thành viên:*\n"
+                f"• `/like <uid>` — Like (user: 2 lần/ngày • admin: không giới hạn)\n")
+
+        if is_admin(user_id):
+            text += (f"\n📌 *Lệnh Admin:*\n"
+                     f"• `/autolike <uid> <số_like>` — Autolike 5h sáng\n"
+                     f"• `/checkautolike` — Xem DS autolike\n"
+                     f"• `/removeallautolike` — Xoá hết autolike\n"
+                     f"• `/listbox` — Xem box\n"
+                     f"• `/debug` — Debug\n")
+
+        if is_super_admin(user_id):
+            text += (f"\n📌 *Super Admin:*\n"
+                     f"• `/addbox <chat_id>` — Thêm nhóm\n"
+                     f"• `/removebox <chat_id>` — Xoá nhóm\n"
+                     f"• `/addadmin <user_id>` — Thêm super admin\n"
+                     f"• `/addadminth <user_id>` — Thêm admin\n"
+                     f"• `/removeadmin <user_id>` — Xoá admin\n"
+                     f"• `/listadmin` — DS admin\n"
+                     f"• `/lock` / `/unlock` / `/listlocked`\n"
+                     f"• `/offlike` — Tắt lệnh /like cho user\n"
+                     f"• `/onlike` — Bật lại lệnh /like\n")
+
+        text += (f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"⏰ Autolike: *{time_str_auto()}* (VN)\n"
+                 f"💎 {SIGNATURE}")
+        await safe_send(update, text)
+    except Exception as e:
+        logger.error(f"start: {e}")
+
+
+async def offlike_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin mới được dùng lệnh này.")
+        return
+    set_like_enabled(False)
+    await safe_send(update, "🔕 Đã tắt lệnh /like cho người dùng. Dùng /onlike để bật lại.")
+
+
+async def onlike_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin mới được dùng lệnh này.")
+        return
+    set_like_enabled(True)
+    await safe_send(update, "✅ Đã bật lại lệnh /like cho người dùng.")
+
+
+async def like_cmd(update, context):
+    try:
+        user_id = update.effective_user.id
+        if not is_like_enabled() and not is_admin(user_id):
+            await safe_send(update, "🔕 *Lệnh /like hiện đang tắt.* Vui lòng thử lại sau.")
+            return
+        if not await require_join(update, context): return
+        if not context.args:
+            await safe_send(update, "⚠️ Dùng: `/like <uid>`")
+            return
+        uid = context.args[0].strip()
+        if not is_valid_uid(uid):
+            await safe_send(update, "⚠️ UID không hợp lệ.")
+            return
+
+        user_id = update.effective_user.id
+        if not can_use_like_today(user_id):
+            await safe_send(
+                update,
+                "⛔ *Bạn đã hết 2 lượt /like hôm nay.*\n"
+                "🕛 Lượt dùng sẽ được reset lúc *00:00 (giờ Việt Nam)* ngày mới."
+            )
+            return
+
+        msg = await update.message.reply_text("⏳ Đang gửi like...")
+
+        data = call_like_api(uid, target=LIKE_MEMBER_MAX)
+
+        # Chỉ trừ lượt khi API trả về like thành công.
+        if data.get("status") == 0:
+            mark_like_used(user_id)
+        ts = now_vn().strftime("%H:%M:%S %d/%m/%Y")
+        final = f"🕐 {ts}\n\n{format_like_message(data, uid)}"
+        if data.get("status") == 0 and not is_admin(user_id):
+            remaining = LIKE_DAILY_LIMIT - get_like_count_today(user_id)
+            final += f"\n\n📌 *Lượt /like hôm nay:* `{LIKE_DAILY_LIMIT - remaining}/{LIKE_DAILY_LIMIT}`\n" \
+                     f"🔋 *Còn lại:* `{remaining}` lượt"
+
+        try: await msg.edit_text(final, parse_mode="Markdown")
+        except: pass
+
+        if data.get("status") == 0:
+            await broadcast_to_all_groups(context.application, final)
+    except Exception as e:
+        logger.error(f"like_cmd: {e}")
+
+
+# ============ AUTOLIKE ============
+async def autolike_cmd(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin.")
+        return
+    if len(context.args) < 2:
+        await safe_send(update,
+            "⚠️ Dùng: `/autolike <uid> <số_like>`\n\n"
+            "Ví dụ:\n"
+            "`/autolike 185062076 500` — autolike 500 like\n"
+            f"💡 Bot chạy lúc `{time_str_auto()}` (VN) hàng ngày.")
+        return
+
+    uid = context.args[0].strip()
+    likes_raw = context.args[1].strip()
+
+    if not is_valid_uid(uid):
+        await safe_send(update, "⚠️ UID không hợp lệ.")
+        return
+    if not likes_raw.isdigit() or int(likes_raw) < 1:
+        await safe_send(update, "⚠️ Số like phải là số nguyên dương.")
+        return
+
+    likes = int(likes_raw)
+    key = str(update.effective_user.id)
+
+    data = load_data()
+    entries = data.get(key, [])
+    found = False
+    for e in entries:
+        if e["uid"] == uid:
+            e["target_likes"] = likes
+            found = True
+            break
+    if not found:
+        entries.append({"uid": uid, "target_likes": likes, "end_date": "2099-12-31"})
+    data[key] = entries
+    save_data(data)
+
+    text = (
+        f"╭──────────────────────────╮\n"
+        f"│  ✅ *ĐẶT AUTOLIKE*  │\n"
+        f"╰──────────────────────────╯\n\n"
+        f"🆔 *UID:* `{uid}`\n"
+        f"❤️ *Số like:* *{likes}*\n"
+        f"⏰ *Chạy lúc:* `{time_str_auto()}` (VN)\n"
+        f"🔄 *Tần suất:* Hàng ngày\n\n"
+        f"📊 Xem: /checkautolike\n"
+        f"{SIGNATURE}"
+    )
+    await safe_send(update, text)
+
+
+# ============ CHECK AUTOLIKE ============
+async def check_autolike(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin.")
+        return
+
+    key = str(update.effective_user.id)
+    data = load_data()
+    entries = data.get(key, [])
+
+    today = now_vn().strftime("%Y-%m-%d")
+    entries = [e for e in entries if e.get("end_date", "2099-12-31") >= today]
+
+    if not entries:
+        await safe_send(update, "📭 *Chưa có autolike nào.*")
+        return
+
+    kb = []
+    total_sent_today = 0
+    total_sent_all = 0
+    total_target = 0
+    done_count = 0
+
+    for e in entries:
+        uid = e["uid"]
+        target = e.get("target_likes", 220)
+        prog = get_progress(uid, target)
+        sent_today = prog["sent_today"]
+        sent_total = prog["sent_total"]
+        days = prog["days"]
+
+        total_sent_today += sent_today
+        total_sent_all += sent_total
+        total_target += target
+        if sent_today >= target:
+            done_count += 1
+
+        if sent_today >= target:
+            status = "✅"
+        elif sent_today > 0:
+            status = "🟡"
+        else:
+            status = "⏳"
+
+        kb.append([
+            InlineKeyboardButton(
+                f"{status} {uid} • {sent_total} like ({days}d)",
+                callback_data=f"al_info_{uid}"
+            ),
+            InlineKeyboardButton("❌ XOÁ", callback_data=f"al_del_{uid}")
+        ])
+
+    kb.append([InlineKeyboardButton("🗑 XOÁ TẤT CẢ", callback_data="al_del_all")])
+    kb.append([InlineKeyboardButton("🔄 LÀM MỚI", callback_data="al_refresh")])
+
+    text = (
+        f"╭──────────────────────────╮\n"
+        f"│  📋 *DANH SÁCH AUTOLIKE*  │\n"
+        f"╰──────────────────────────╯\n\n"
+        f"📊 *Tổng:* {len(entries)} UID\n"
+        f"✅ *Hoàn thành hôm nay:* {done_count}/{len(entries)}\n\n"
+        f"📅 *Hôm nay:* `{total_sent_today}` / `{total_target}`\n"
+        f"💎 *Tổng tích lũy:* `{total_sent_all}` like\n\n"
+        f"⏰ *Chạy lúc:* {time_str_auto()} (VN)\n\n"
+        f"*Chú thích:*\n"
+        f"✅ Đủ mục tiêu • 🟡 Đang chạy • ⏳ Chưa chạy\n"
+        f"(Xd) = số ngày đã autolike\n\n"
+        f"👇 Bấm nút để xem/xoá\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 {SIGNATURE}"
+    )
+
+    await safe_send(update, text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def remove_all_autolike(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin."); return
+    key = str(update.effective_user.id)
+    data = load_data()
+    if key in data:
+        del data[key]; save_data(data)
+        await safe_send(update, "🗑 Đã xoá toàn bộ autolike.")
+    else:
+        await safe_send(update, "❌ Chưa đặt autolike.")
+
+
+# ============ CALLBACK HANDLER ============
+async def callback_handler(update, context):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    data_cb = query.data
+
+    # Nút xác nhận tham gia đủ các kênh bắt buộc dành cho mọi người dùng
+    if data_cb == "check_join":
+        missing = await get_missing_groups(context, user_id)
+        if missing:
+            lines = ["⛔ *Bạn chưa tham gia đủ các kênh bắt buộc.*", "", "📋 Vui lòng vào các kênh còn thiếu rồi xác nhận lại:"]
+            kb = []
+            for gid in missing:
+                link = GROUP_LINKS.get(gid, "https://t.me/ductri36skin")
+                name = GROUP_NAMES.get(gid, f"Nhóm {gid}")
+                kb.append([InlineKeyboardButton(f"📥 Vào {name}", url=link)])
+            kb.append([InlineKeyboardButton("✅ Xác nhận đã vào đủ nhóm", callback_data="check_join")])
+            try:
+                await query.answer("Bạn vẫn chưa vào đủ kênh.", show_alert=True)
+                await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                pass
+        else:
+            try:
+                await query.answer("✅ Đã xác nhận: bạn tham gia đủ 2 kênh!", show_alert=True)
+                await query.edit_message_text(
+                    "✅ *Xác nhận thành công!* Bạn đã tham gia đủ 2 kênh bắt buộc.\n\n👉 Quay lại nhóm bot để sử dụng lệnh.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        return
+
+    try: await query.answer()
+    except: pass
+
+    if not is_admin(user_id): return
+    key = str(user_id)
+
+    # ============ XOÁ 1 UID ============
+    if data_cb.startswith("al_del_") and data_cb != "al_del_all":
+        uid = data_cb.replace("al_del_", "")
+        data = load_data()
+        entries = data.get(key, [])
+        new_entries = [e for e in entries if e["uid"] != uid]
+        if new_entries:
+            data[key] = new_entries
+        else:
+            data.pop(key, None)
+        save_data(data)
+
+        try:
+            await query.answer(f"🗑 Đã xoá {uid}", show_alert=True)
+        except: pass
+
+        await _refresh_autolike_message(query, key, context)
+        return
+
+    # ============ XOÁ TẤT CẢ ============
+    if data_cb == "al_del_all":
+        data = load_data()
+        if key in data:
+            del data[key]
+            save_data(data)
+        try:
+            await query.answer("🗑 Đã xoá tất cả autolike!", show_alert=True)
+        except: pass
+        try:
+            await query.message.edit_text(
+                f"🗑 *ĐÃ XOÁ TẤT CẢ AUTOLIKE*\n\n"
+                f"📊 Tổng: *0* UID\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💎 {SIGNATURE}",
+                parse_mode="Markdown"
+            )
+        except: pass
+        return
+
+    # ============ LÀM MỚI ============
+    if data_cb == "al_refresh":
+        await _refresh_autolike_message(query, key, context)
+        return
+
+    # ============ XEM CHI TIẾT ============
+    if data_cb.startswith("al_info_"):
+        uid = data_cb.replace("al_info_", "")
+        data = load_data()
+        entries = data.get(key, [])
+        for e in entries:
+            if e["uid"] == uid:
+                target = e.get("target_likes", 220)
+                prog = get_progress(uid, target)
+                sent_today = prog["sent_today"]
+                sent_total = prog["sent_total"]
+                days = prog["days"]
+                first_run = prog["first_run"]
+                last_run = prog["last_run"]
+
+                progress_pct = int((sent_today / target) * 100) if target > 0 else 0
+
+                bar_len = 15
+                filled = int(bar_len * sent_today / target) if target > 0 else 0
+                bar = "█" * filled + "░" * (bar_len - filled)
+
+                avg_per_day = int(sent_total / days) if days > 0 else 0
+
+                text = (
+                    f"╭──────────────────────────╮\n"
+                    f"│  📋 *CHI TIẾT AUTOLIKE*  │\n"
+                    f"╰──────────────────────────╯\n\n"
+                    f"🆔 *UID:* `{uid}`\n"
+                    f"❤️ *Mục tiêu/ngày:* *{target}* like\n"
+                    f"🔄 *Tần suất:* Hàng ngày ({time_str_auto()} VN)\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📅 *TIẾN ĐỘ HÔM NAY:*\n"
+                    f"`{bar}` {progress_pct}%\n"
+                    f"🔥 *Hôm nay:* `{sent_today}/{target}` like\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💎 *TỔNG TÍCH LŨY:*\n"
+                    f"📊 *Tổng like:* `{sent_total}`\n"
+                    f"🗓 *Số ngày:* `{days}` ngày\n"
+                    f"📈 *TB/ngày:* `{avg_per_day}` like\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"▶️ *Chạy đầu:* {first_run}\n"
+                    f"⏹ *Chạy cuối:* {last_run}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💎 {SIGNATURE}"
+                )
+                kb = [
+                    [InlineKeyboardButton("🗑 XOÁ UID NÀY", callback_data=f"al_del_{uid}")],
+                    [InlineKeyboardButton("⬅️ Quay lại", callback_data="al_back")],
+                ]
+                try:
+                    await query.message.edit_text(text, parse_mode="Markdown",
+                                                  reply_markup=InlineKeyboardMarkup(kb))
+                except: pass
+                return
+        try: await query.message.edit_text("❌ Không tìm thấy UID.")
+        except: pass
+        return
+
+    # ============ QUAY LẠI ============
+    if data_cb == "al_back":
+        await _refresh_autolike_message(query, key, context)
+        return
+
+
+async def _refresh_autolike_message(query, key, context):
+    data = load_data()
+    entries = data.get(key, [])
+    today = now_vn().strftime("%Y-%m-%d")
+    entries = [e for e in entries if e.get("end_date", "2099-12-31") >= today]
+
+    if not entries:
+        try:
+            await query.message.edit_text(
+                f"📭 *Không còn autolike nào.*\n\n💎 {SIGNATURE}",
+                parse_mode="Markdown"
+            )
+        except: pass
+        return
+
+    kb = []
+    total_sent_today = 0
+    total_sent_all = 0
+    total_target = 0
+    done_count = 0
+
+    for e in entries:
+        uid = e["uid"]
+        target = e.get("target_likes", 220)
+        prog = get_progress(uid, target)
+        sent_today = prog["sent_today"]
+        sent_total = prog["sent_total"]
+        days = prog["days"]
+
+        total_sent_today += sent_today
+        total_sent_all += sent_total
+        total_target += target
+        if sent_today >= target:
+            done_count += 1
+
+        if sent_today >= target:
+            status = "✅"
+        elif sent_today > 0:
+            status = "🟡"
+        else:
+            status = "⏳"
+
+        kb.append([
+            InlineKeyboardButton(
+                f"{status} {uid} • {sent_total} like ({days}d)",
+                callback_data=f"al_info_{uid}"
+            ),
+            InlineKeyboardButton("❌ XOÁ", callback_data=f"al_del_{uid}")
+        ])
+    kb.append([InlineKeyboardButton("🗑 XOÁ TẤT CẢ", callback_data="al_del_all")])
+    kb.append([InlineKeyboardButton("🔄 LÀM MỚI", callback_data="al_refresh")])
+
+    text = (
+        f"╭──────────────────────────╮\n"
+        f"│  📋 *DANH SÁCH AUTOLIKE*  │\n"
+        f"╰──────────────────────────╯\n\n"
+        f"📊 *Tổng:* {len(entries)} UID\n"
+        f"✅ *Hoàn thành hôm nay:* {done_count}/{len(entries)}\n\n"
+        f"📅 *Hôm nay:* `{total_sent_today}` / `{total_target}`\n"
+        f"💎 *Tổng tích lũy:* `{total_sent_all}` like\n\n"
+        f"⏰ *Chạy lúc:* {time_str_auto()} (VN)\n\n"
+        f"*Chú thích:*\n"
+        f"✅ Đủ mục tiêu • 🟡 Đang chạy • ⏳ Chưa chạy\n"
+        f"(Xd) = số ngày đã autolike\n\n"
+        f"👇 Bấm nút để xem/xoá\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 {SIGNATURE}"
+    )
+
+    try:
+        await query.message.edit_text(text, parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+    except: pass
+
+
+# ============ BOX / ADMIN ============
+async def addbox_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/addbox <chat_id>`"); return
+    gid_raw = context.args[0].strip()
+    if not gid_raw.lstrip("-").isdigit():
+        await safe_send(update, "⚠️ chat_id phải là số."); return
+    gid = int(gid_raw)
+    if gid in REQUIRED_GROUPS or gid in load_boxes():
+        await safe_send(update, f"ℹ️ Nhóm `{gid}` đã có."); return
+    try:
+        bm = await context.bot.get_chat_member(chat_id=gid, user_id=context.bot.id)
+        st = bm.status
+    except Exception as e:
+        await safe_send(update, f"❌ Không truy cập `{gid}`.\n{e}"); return
+    boxes = load_boxes(); boxes.append(gid); save_boxes(boxes)
+    await safe_send(update, f"✅ Đã thêm `{gid}`\n🤖 Status: `{st}`\n📋 Tổng: *{len(get_active_groups())}*")
+
+
+async def removebox_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/removebox <chat_id>`"); return
+    gid = int(context.args[0].strip())
+    if gid in REQUIRED_GROUPS:
+        await safe_send(update, "⛔ Không xoá nhóm gốc."); return
+    boxes = load_boxes()
+    if gid not in boxes:
+        await safe_send(update, f"❌ Nhóm `{gid}` không có."); return
+    boxes.remove(gid); save_boxes(boxes)
+    await safe_send(update, f"🗑 Đã xoá `{gid}`.")
+
+
+async def listbox_cmd(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin."); return
+    boxes = load_boxes(); req = get_required_groups()
+    lines = ["📦 *DANH SÁCH NHÓM*\n", f"🔒 *Bắt buộc ({len(req)}):*"]
+    for g in req: lines.append(f"• `{g}`")
+    lines.append(f"\n🤖 *Động ({len(boxes)}):*")
+    for g in boxes: lines.append(f"• `{g}`")
+    if not boxes: lines.append("_(trống)_")
+    lines.append(f"\n📊 *Tổng: {len(get_active_groups())}*\n{SIGNATURE}")
+    await safe_send(update, "\n".join(lines))
+
+
+async def addadmin_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/addadmin <user_id>`"); return
+    t = int(context.args[0].strip())
+    if is_super_admin(t):
+        await safe_send(update, f"ℹ️ `{t}` đã là super admin."); return
+    ex = load_extra_super_admins(); ex.append(t); save_extra_super_admins(ex)
+    await safe_send(update, f"✅ Đã thêm *super admin* `{t}`\n📋 Tổng: *{len(ex)}*")
+
+
+async def addadminth_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/addadminth <user_id>`"); return
+    t = int(context.args[0].strip())
+    if is_super_admin(t):
+        await safe_send(update, f"ℹ️ `{t}` đã là super admin."); return
+    ex = load_extra_admins()
+    if t in ex:
+        await safe_send(update, f"ℹ️ `{t}` đã là admin."); return
+    ex.append(t); save_extra_admins(ex)
+    await safe_send(update, f"✅ Đã thêm *admin* `{t}`\n📋 Tổng: *{len(ex)}*")
+
+
+async def removeadmin_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/removeadmin <user_id>`"); return
+    t = int(context.args[0].strip())
+    if t in ADMIN_IDS:
+        await safe_send(update, "⛔ Không xoá super admin gốc."); return
+    rm = []
+    es = load_extra_super_admins()
+    if t in es: es.remove(t); save_extra_super_admins(es); rm.append("super admin")
+    en = load_extra_admins()
+    if t in en: en.remove(t); save_extra_admins(en); rm.append("admin")
+    if not rm:
+        await safe_send(update, f"❌ `{t}` không có."); return
+    await safe_send(update, f"🗑 Đã xoá `{t}` khỏi: *{', '.join(rm)}*.")
+
+
+async def listadmin_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    es = load_extra_super_admins(); en = load_extra_admins()
+    lines = ["🔑 *DANH SÁCH ADMIN*\n", f"*Super admin gốc ({len(ADMIN_IDS)}):*"]
+    for a in ADMIN_IDS: lines.append(f"• `{a}`")
+    lines.append(f"\n*Super admin phụ ({len(es)}):*")
+    for a in es: lines.append(f"• `{a}`")
+    if not es: lines.append("_(trống)_")
+    lines.append(f"\n*Admin thường ({len(en)}):*")
+    for a in en: lines.append(f"• `{a}`")
+    if not en: lines.append("_(trống)_")
+    lines.append(f"\n{SIGNATURE}")
+    await safe_send(update, "\n".join(lines))
+
+
+async def lock_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/lock <user_id>`"); return
+    set_user(context.args[0].strip(), locked=True)
+    await safe_send(update, f"🔒 Đã khoá `{context.args[0]}`.")
+
+
+async def unlock_cmd(update, context):
+    if not is_super_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ super admin."); return
+    if not context.args:
+        await safe_send(update, "⚠️ `/unlock <user_id>`"); return
+    set_user(context.args[0].strip(), locked=False, joined=True)
+    await safe_send(update, f"🔓 Đã mở khoá `{context.args[0]}`.")
+
+
+async def listlocked_cmd(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin."); return
+    users = load_users()
+    locked = [u for u, v in users.items() if v.get("locked")]
+    if not locked:
+        await safe_send(update, "✅ Không có user bị khoá."); return
+    await safe_send(update, f"🔒 *User bị khoá:*\n\n" + "\n".join(f"• `{u}`" for u in locked))
+
+
+async def debug_cmd(update, context):
+    if not is_admin(update.effective_user.id):
+        await safe_send(update, "⛔ Chỉ admin."); return
+    uid = update.effective_user.id
+    if is_super_admin(uid): role = "Super Admin"
+    elif is_normal_admin(uid): role = "Admin"
+    else: role = "User"
+    await safe_send(update,
+        f"🕐 Giờ VN: {now_vn().strftime('%H:%M:%S %d/%m/%Y')}\n"
+        f"⏰ Giờ hẹn: {time_str_auto()}\n"
+        f"👤 Vai trò: {role}\n"
+        f"🆔 Chat ID: {uid}\n"
+        f"🔒 Nhóm bắt buộc: {len(get_required_groups())}\n"
+        f"🤖 Nhóm hoạt động: {len(get_active_groups())}\n"
+        f"📋 Autolike: {len(load_data().get(str(uid), []))} UID\n"
+        f"{SIGNATURE}")
+
+
+# ============ MEMBER OUT ============
+async def chat_member_update(update, context):
+    cm = update.chat_member
+    if not cm or cm.chat.id not in get_required_groups(): return
+    old = cm.old_chat_member.status; new = cm.new_chat_member.status
+    uid = cm.new_chat_member.user.id
+    if is_admin(uid): return
+    if new in ("left", "kicked") and old in ("member", "administrator", "creator"):
+        miss = await get_missing_groups(context, uid)
+        if miss:
+            set_user(uid, joined=False, locked=True)
+            text = f"🔒 *Bạn đã out nhóm → khoá.*\n\n📋 Còn thiếu *{len(miss)}* nhóm:"
+            kb = []
+            for i, gid in enumerate(miss, 1):
+                link = GROUP_LINKS.get(gid, "https://t.me/ductri36skin")
+                kb.append([InlineKeyboardButton(f"📥 Vào {GROUP_NAMES.get(gid, f'Nhóm {gid}')}", url=link)])
+            try:
+                await context.bot.send_message(chat_id=uid, text=text,
+                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+            except: pass
+
+
+# ============ AUTOLIKE JOB ============
+async def run_autolike_job(app):
+    now = now_vn(); ts = now.strftime("%H:%M:%S %d/%m/%Y")
+    today = now.strftime("%Y-%m-%d")
+    data = load_data()
+    if not data:
+        logger.info("[AUTO] Không có autolike."); return
+    logger.info(f"[AUTO] Bắt đầu {ts}")
+    for key, entries in list(data.items()):
+        active = [e for e in entries if e.get("end_date", "2099-12-31") >= today]
+        if not active:
+            data.pop(key, None); continue
+        data[key] = active
+        for e in active:
+            uid = e["uid"]; target = e.get("target_likes", 220)
+            logger.info(f"→ Autolike {uid} (target {target})")
+            res = call_like_api(uid, target=target)
+
+            # ⭐ Lưu tiến độ tích lũy
+            if res.get("status") == 0:
+                sent = res.get("likes_given", 0)
+                save_progress(uid, sent, target)
+            else:
+                save_progress(uid, 0, target)
+
+            if res.get("status") == 0:
+                header = "✅ *AUTOLIKE THÀNH CÔNG*"
+            elif res.get("status") == "off":
+                header = "🔕 *AUTOLIKE - LIKE ĐANG TẮT*"
+            else:
+                header = "❌ *AUTOLIKE THẤT BẠI*"
+
+            if res.get("status") == 0:
+                sent_val = res.get('likes_given', 0)
+                prog = get_progress(uid, target)
+                body = (
+                    f"👤 *Tên:* {res.get('nickname', 'N/A')}\n"
+                    f"🆔 *UID:* `{uid}`\n"
+                    f"🎮 *Level:* {res.get('level', '?')}\n"
+                    f"🌍 *Region:* {res.get('region', 'VN')}\n\n"
+                    f"❤️ *Likes trước:* `{res.get('likes_before', 0)}`\n"
+                    f"💚 *Likes sau:* `{res.get('likes_after', 0)}`\n"
+                    f"🔥 *Like đã gửi:* `+{sent_val}`\n"
+                    f"🎯 *Mục tiêu:* `{target}` like\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📅 *Hôm nay:* `{sent_val}/{target}`\n"
+                    f"💎 *Tổng tích lũy:* `{prog['sent_total']}` like\n"
+                    f"🗓 *Số ngày:* `{prog['days']}` ngày\n"
+                    f"⏱ *Thời gian:* {res.get('time', '?')} sec"
+                )
+            else:
+                body = f"🆔 *UID:* `{uid}`\n📝 *Lý do:* {res.get('message', 'Unknown')}"
+
+            text = (f"╭──────────────────────────╮\n"
+                    f"│  {header}  │\n"
+                    f"╰──────────────────────────╯\n"
+                    f"🕐 {ts}\n\n"
+                    f"{body}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💎 {SIGNATURE}")
+            await broadcast_to_all_groups(app, text)
+            await asyncio.sleep(2)
+    save_data(data)
+    logger.info("[AUTO] Xong")
+
+
+# ============ SCHEDULER ============
+def start_scheduler(app):
+    def loop():
+        logger.info(f"✅ Scheduler bật. Giờ VN: {now_vn().strftime('%H:%M:%S')}")
+        last_run = None
+        while True:
+            try:
+                now = now_vn(); today = now.strftime("%Y-%m-%d")
+                if (now.hour == AUTOLIKE_HOUR and now.minute == AUTOLIKE_MINUTE
+                        and now.second == AUTOLIKE_SECOND and last_run != today):
+                    logger.info(f"⏰ ĐẾN GIỜ AUTOLIKE — {now.strftime('%H:%M:%S')}")
+                    last_run = today
+                    if BOT_LOOP:
+                        try:
+                            fut = asyncio.run_coroutine_threadsafe(run_autolike_job(app), BOT_LOOP)
+                            fut.result(timeout=3600)
+                        except Exception as e:
+                            logger.error(f"Autolike: {e}")
+            except Exception as e:
+                logger.error(f"Scheduler: {e}")
+            time.sleep(0.5)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def start_health_server():
+    try:
+        from flask import Flask
+    except ImportError: return
+    fa = Flask(__name__)
+    @fa.route("/")
+    def h(): return f"OK — {now_vn().strftime('%H:%M:%S %d/%m/%Y')}"
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=lambda: fa.run(host="0.0.0.0", port=port,
+                     debug=False, use_reloader=False), daemon=True).start()
+    logger.info(f"✅ Health server port {port}")
+
+
+# ============ MAIN ============
+def main():
+    logger.info("🚀 Khởi động bot...")
+    req = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0,
+                       read_timeout=30.0, write_timeout=30.0, pool_timeout=10.0)
+    upreq = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0,
+                         read_timeout=60.0, write_timeout=30.0, pool_timeout=10.0)
+    while True:
+        try:
+            app = (Application.builder().token(BOT_TOKEN)
+                   .request(req).get_updates_request(upreq).build())
+
+            async def err_handler(update, context):
+                err = context.error
+                if err: logger.error(f"Handler error: {type(err).__name__}: {err}")
+            app.add_error_handler(err_handler)
+
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("like", like_cmd))
+            app.add_handler(CommandHandler("offlike", offlike_cmd))
+            app.add_handler(CommandHandler("onlike", onlike_cmd))
+            app.add_handler(CommandHandler("autolike", autolike_cmd))
+            app.add_handler(CommandHandler("checkautolike", check_autolike))
+            app.add_handler(CommandHandler("removeallautolike", remove_all_autolike))
+            app.add_handler(CommandHandler("addbox", addbox_cmd))
+            app.add_handler(CommandHandler("removebox", removebox_cmd))
+            app.add_handler(CommandHandler("listbox", listbox_cmd))
+            app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+            app.add_handler(CommandHandler("addadminth", addadminth_cmd))
+            app.add_handler(CommandHandler("removeadmin", removeadmin_cmd))
+            app.add_handler(CommandHandler("listadmin", listadmin_cmd))
+            app.add_handler(CommandHandler("lock", lock_cmd))
+            app.add_handler(CommandHandler("unlock", unlock_cmd))
+            app.add_handler(CommandHandler("listlocked", listlocked_cmd))
+            app.add_handler(CommandHandler("debug", debug_cmd))
+            app.add_handler(CallbackQueryHandler(callback_handler, pattern="^(al_.*|check_join)$"))
+            app.add_handler(ChatMemberHandler(chat_member_update,
+                ChatMemberHandler.CHAT_MEMBER))
+
+            async def post_init(application):
+                global BOT_LOOP
+                BOT_LOOP = asyncio.get_running_loop()
+                logger.info("✅ Đã lưu BOT_LOOP")
+                start_scheduler(application)
+                start_health_server()
+
+            app.post_init = post_init
+            logger.info("✅ Chạy polling...")
+            app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+            break
+        except Exception as e:
+            logger.error(f"❌ Bot crash: {e}")
+            logger.info("⏳ Thử lại sau 10s...")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
